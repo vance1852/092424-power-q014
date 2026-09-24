@@ -13,6 +13,9 @@ ZERO = Decimal("0")
 HUNDRED = Decimal("100")
 BASIS_POINTS = Decimal("10000")
 
+# 情景投影算法版本：输入快照或算法本身变化都会产生新的结果版本。
+ALGORITHM_VERSION = "supply-projection/1.0.0"
+
 
 def quantize_volume(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)

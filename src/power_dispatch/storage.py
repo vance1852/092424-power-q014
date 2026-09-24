@@ -165,11 +165,79 @@ CREATE TABLE IF NOT EXISTS scenario_runs (
     scenario_id TEXT NOT NULL REFERENCES supply_scenarios(scenario_id),
     as_of_date TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
     created_at TEXT NOT NULL,
-    UNIQUE(scenario_id, as_of_date, input_sha256)
+    UNIQUE(scenario_id, as_of_date, input_sha256, algorithm_version)
 );
+
+CREATE TABLE IF NOT EXISTS scenario_sets (
+    set_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    definition_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','frozen','retired')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    approved_by TEXT REFERENCES supply_users(user_id),
+    approved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scenario_set_members (
+    set_id TEXT NOT NULL REFERENCES scenario_sets(set_id),
+    scenario_id TEXT NOT NULL REFERENCES supply_scenarios(scenario_id),
+    position INTEGER NOT NULL,
+    scenario_sha256 TEXT NOT NULL,
+    scenario_revision INTEGER NOT NULL,
+    PRIMARY KEY(set_id, scenario_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scenario_set_members
+ON scenario_set_members(set_id, position);
+
+CREATE TABLE IF NOT EXISTS scenario_set_runs (
+    set_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    set_id TEXT NOT NULL REFERENCES scenario_sets(set_id),
+    content_sha256 TEXT NOT NULL,
+    date_from TEXT NOT NULL,
+    date_to TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('running','completed','completed_with_failures')),
+    total_items INTEGER NOT NULL,
+    succeeded_items INTEGER NOT NULL DEFAULT 0,
+    failed_items INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT NOT NULL,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(set_id, content_sha256, date_from, date_to, algorithm_version)
+);
+
+CREATE TABLE IF NOT EXISTS scenario_set_run_items (
+    set_run_id INTEGER NOT NULL REFERENCES scenario_set_runs(set_run_id),
+    position INTEGER NOT NULL,
+    scenario_id TEXT NOT NULL,
+    as_of_date TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('succeeded','failed')),
+    scenario_run_id INTEGER REFERENCES scenario_runs(run_id),
+    result_json TEXT,
+    input_sha256 TEXT,
+    algorithm_version TEXT,
+    scenario_sha256 TEXT,
+    scenario_revision INTEGER,
+    price_snapshot_json TEXT,
+    demand_changes_json TEXT,
+    route_limits_json TEXT,
+    inventory_snapshot_json TEXT,
+    failure_code TEXT,
+    failure_reason TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(set_run_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scenario_set_run_items
+ON scenario_set_run_items(scenario_id, as_of_date);
 
 CREATE TABLE IF NOT EXISTS supply_idempotency (
     scope TEXT NOT NULL,
@@ -198,7 +266,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
@@ -209,6 +277,13 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(scenario_runs)").fetchall()}
+    if columns and "algorithm_version" not in columns:
+        connection.execute("ALTER TABLE scenario_runs ADD COLUMN algorithm_version TEXT")
 
 
 @contextmanager

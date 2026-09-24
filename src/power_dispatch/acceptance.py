@@ -28,9 +28,19 @@ def run(workspace: Path) -> dict[str, object]:
     allocation = service.allocate("dispatch", "pipe-a-b", "2026-09-25")
     transfer = service.dispatch_transfer("dispatch", "transfer-001", "nom-001", "lot-001", 2)
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
+    service.create_scenario("plan", {"scenario_id": "demand-surge", "name": "负荷冲高与送出受限", "market_index_drop_percent": "-4", "route_capacity_changes": {"pipe-a-b": "-15"}, "demand_changes": {"field-a:crude": "8"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
+    service.approve_scenario("risk", "demand-surge", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    set_payload = {"set_id": "peak-valley-pack", "name": "三套峰谷假设对比", "scenario_ids": ["pipeline-restart", "demand-surge"], "date_from": "2026-09-17", "date_to": "2026-09-23"}
+    service.create_scenario_set("plan", set_payload)
+    service.approve_scenario_set("risk", "peak-valley-pack", 1)
+    batch = service.run_scenario_set("plan", "peak-valley-pack")
+    replay = service.run_scenario_set("plan", "peak-valley-pack")
+    if not replay["replayed"] or replay["items_digest"] != batch["items_digest"]:
+        raise AssertionError("情景集合重放摘要不一致")
+    report = service.scenario_set_run_report("audit", batch["set_run_id"])
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "scenario_set_run_id": batch["set_run_id"], "batch": {"total": batch["total_items"], "succeeded": batch["succeeded_items"], "failed": batch["failed_items"], "items_digest": batch["items_digest"], "aggregate": batch["aggregate"]}, "report_chain_valid": report["chain"]["valid"], "audit_trail_events": len(report["audit_trail"]), "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 

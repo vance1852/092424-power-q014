@@ -5,16 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .errors import Conflict, Forbidden, InvalidState, NotFound, SupplyError, ValidationFailed
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    ScenarioSet,
+    SupplyScenario,
+    date_text,
+    positive_integer,
+)
 from .planning import (
+    ALGORITHM_VERSION,
     AllocationRequest,
     PricePoint,
+    ZERO,
     allocate_capacity,
     canonical_json,
     decimal_text,
@@ -23,6 +35,7 @@ from .planning import (
     effective_capacity,
     latest_streak,
     moving_average,
+    quantize_money,
     quantize_volume,
     scenario_projection,
     weighted_inventory_cost,
@@ -31,10 +44,24 @@ from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
+    "planner": {
+        "quote.write",
+        "catalog.write",
+        "scenario.write",
+        "scenario.run",
+        "scenario_set.write",
+        "scenario_set.run",
+        "scenario_set.read",
+    },
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "risk": {
+        "outage.write",
+        "scenario.approve",
+        "scenario_set.approve",
+        "scenario_set.read",
+        "report.read",
+    },
+    "auditor": {"scenario_set.read", "report.read", "audit.read"},
 }
 
 
@@ -504,32 +531,100 @@ class SupplyService:
             raise NotFound("情景不存在")
         if row["state"] != "approved":
             raise InvalidState("只有已批准情景可以运行")
-        scenario = SupplyScenario.from_dict(json.loads(row["definition_json"]))
+        outcome = self._execute_scenario(row, as_of_date)
+        run_id, _, replayed = self._store_scenario_run(row, as_of_date, outcome, actor_id, audit_event=True)
+        return {"run_id": run_id, **outcome["result"], "replayed": replayed}
+
+    def _day_outages(self, as_of_date: str) -> dict[str, list[sqlite3.Row]]:
+        rows = self.connection.execute(
+            "SELECT * FROM route_outages WHERE state IN ('announced','active') "
+            "AND starts_at<=? AND (ends_at IS NULL OR ends_at>=?) ORDER BY outage_id",
+            (as_of_date + "T23:59:59Z", as_of_date + "T00:00:00Z"),
+        ).fetchall()
+        grouped: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(row["route_id"], []).append(row)
+        return grouped
+
+    def _execute_scenario(self, scenario_row: sqlite3.Row, as_of_date: str) -> dict[str, Any]:
+        """组装输入快照并执行投影。任何输入缺口都抛 SupplyError 由调用方记录为失败。"""
+        scenario = SupplyScenario.from_dict(json.loads(scenario_row["definition_json"]))
         price_row = self.connection.execute(
-            "SELECT close_cny FROM market_index_quotes WHERE trade_date<=? ORDER BY trade_date DESC,quote_id DESC LIMIT 1",
+            "SELECT * FROM market_index_quotes WHERE trade_date<=? ORDER BY trade_date DESC,quote_id DESC LIMIT 1",
             (as_of_date,),
         ).fetchone()
         if price_row is None:
             raise InvalidState("截止日期没有可用电价")
-        routes = self.connection.execute("SELECT * FROM routes WHERE state='active' ORDER BY route_id").fetchall()
-        inventory = self.connection.execute(
-            "SELECT facility_id,product,sum(CAST(available_mwh AS REAL)) available_mwh "
-            "FROM inventory_lots GROUP BY facility_id,product ORDER BY facility_id,product"
+        routes = self.connection.execute(
+            "SELECT * FROM routes WHERE state='active' ORDER BY route_id"
         ).fetchall()
+        outages = self._day_outages(as_of_date)
+        route_limits: list[dict[str, Any]] = []
+        for route in routes:
+            active_outages = outages.get(route["route_id"], [])
+            percentages = [Decimal(item["capacity_percent"]) for item in active_outages]
+            effective = effective_capacity(Decimal(route["daily_capacity"]), percentages)
+            route_limits.append({
+                "route_id": route["route_id"],
+                "nominal_capacity": decimal_text(Decimal(route["daily_capacity"])),
+                "effective_capacity": decimal_text(effective),
+                "outages": [
+                    {
+                        "outage_id": item["outage_id"],
+                        "capacity_percent": item["capacity_percent"],
+                        "reason": item["reason"],
+                    }
+                    for item in active_outages
+                ],
+            })
+        lots = self.connection.execute(
+            "SELECT lot_id,facility_id,product,grade,quantity_mwh,available_mwh,unit_cost_cny,"
+            "received_at,revision FROM inventory_lots ORDER BY lot_id"
+        ).fetchall()
+        totals: dict[tuple[str, str], Decimal] = {}
+        for lot in lots:
+            key = (lot["facility_id"], lot["product"])
+            totals[key] = totals.get(key, ZERO) + Decimal(lot["available_mwh"])
+        inventory = [
+            {"facility_id": facility_id, "product": product, "available_mwh": decimal_text(quantize_volume(quantity))}
+            for (facility_id, product), quantity in sorted(totals.items())
+        ]
+        inventory_snapshot = {
+            "as_of_date": as_of_date,
+            "lots": [dict(lot) for lot in lots],
+            "totals": inventory,
+        }
+        price_snapshot = {
+            "quote_id": price_row["quote_id"],
+            "market_index": price_row["market_index"],
+            "trade_date": price_row["trade_date"],
+            "close_cny": price_row["close_cny"],
+            "source_revision": price_row["source_revision"],
+        }
+        # 摘要只包含稳定业务字段，排除 created_at/revision 等随库变化的元数据，
+        # 保证在不同数据库中重建相同输入时得到相同的 input_sha256。
+        route_inputs = [
+            {
+                "route_id": item["route_id"],
+                "origin_id": item["origin_id"],
+                "destination_id": item["destination_id"],
+                "product": item["product"],
+                "daily_capacity": item["daily_capacity"],
+                "loss_basis_points": item["loss_basis_points"],
+                "transit_hours": item["transit_hours"],
+            }
+            for item in routes
+        ]
+        demand_changes = {key: decimal_text(value) for key, value in sorted(scenario.demand_changes.items())}
         input_value = {
-            "scenario_sha256": row["content_sha256"],
+            "algorithm_version": ALGORITHM_VERSION,
+            "scenario_sha256": scenario_row["content_sha256"],
             "as_of_date": as_of_date,
             "price": price_row["close_cny"],
-            "routes": [dict(item) for item in routes],
-            "inventory": [dict(item) for item in inventory],
+            "routes": route_inputs,
+            "route_limits": route_limits,
+            "inventory": inventory,
         }
-        input_sha256 = digest(input_value)
-        existing = self.connection.execute(
-            "SELECT run_id,result_json FROM scenario_runs WHERE scenario_id=? AND as_of_date=? AND input_sha256=?",
-            (scenario_id, as_of_date, input_sha256),
-        ).fetchone()
-        if existing is not None:
-            return {"run_id": existing["run_id"], **json.loads(existing["result_json"]), "replayed": True}
         result = scenario_projection(
             current_price=Decimal(price_row["close_cny"]),
             market_index_drop_percent=scenario.market_index_drop_percent,
@@ -538,18 +633,371 @@ class SupplyService:
             route_capacity_changes=scenario.route_capacity_changes,
             demand_changes=scenario.demand_changes,
         )
+        return {
+            "result": result,
+            "input_sha256": digest(input_value),
+            "price_snapshot": price_snapshot,
+            "demand_changes": demand_changes,
+            "route_limits": route_limits,
+            "inventory_snapshot": inventory_snapshot,
+        }
+
+    def _store_scenario_run(
+        self,
+        scenario_row: sqlite3.Row,
+        as_of_date: str,
+        outcome: Mapping[str, Any],
+        actor_id: str,
+        *,
+        audit_event: bool,
+    ) -> tuple[int, dict[str, Any], bool]:
+        existing = self.connection.execute(
+            "SELECT run_id,result_json FROM scenario_runs WHERE scenario_id=? AND as_of_date=? "
+            "AND input_sha256=? AND (algorithm_version=? OR algorithm_version IS NULL)",
+            (scenario_row["scenario_id"], as_of_date, outcome["input_sha256"], ALGORITHM_VERSION),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["run_id"]), json.loads(existing["result_json"]), True
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
-                "INSERT INTO scenario_runs(scenario_id,as_of_date,input_sha256,result_json,created_by,created_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (scenario_id, as_of_date, input_sha256, canonical_json(result), actor_id, self._now()),
+                "INSERT INTO scenario_runs(scenario_id,as_of_date,input_sha256,algorithm_version,"
+                "result_json,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    scenario_row["scenario_id"],
+                    as_of_date,
+                    outcome["input_sha256"],
+                    ALGORITHM_VERSION,
+                    canonical_json(outcome["result"]),
+                    actor_id,
+                    self._now(),
+                ),
             )
             run_id = int(cursor.lastrowid)
-            self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
-        return {"run_id": run_id, **result, "replayed": False}
+            if audit_event:
+                self._audit("scenario", scenario_row["scenario_id"], "scenario.executed", actor_id, {"run_id": run_id})
+        return run_id, outcome["result"], False
 
-    def audit_chain(self, actor_id: str) -> dict[str, Any]:
-        self._require(actor_id, "audit.read")
+    def _scenario_set_row(self, set_id: str) -> sqlite3.Row:
+        row = self.connection.execute("SELECT * FROM scenario_sets WHERE set_id=?", (set_id,)).fetchone()
+        if row is None:
+            raise NotFound("情景集合不存在")
+        return row
+
+    def _validate_set_members(self, scenario_set: ScenarioSet) -> dict[str, sqlite3.Row]:
+        placeholders = ",".join("?" for _ in scenario_set.scenario_ids)
+        rows = self.connection.execute(
+            f"SELECT * FROM supply_scenarios WHERE scenario_id IN ({placeholders})",
+            scenario_set.scenario_ids,
+        ).fetchall()
+        found = {row["scenario_id"]: row for row in rows}
+        missing = [scenario_id for scenario_id in scenario_set.scenario_ids if scenario_id not in found]
+        if missing:
+            raise ValidationFailed(f"情景不存在: {', '.join(missing)}")
+        return found
+
+    def _insert_set_members(
+        self,
+        set_id: str,
+        scenario_set: ScenarioSet,
+        members: Mapping[str, sqlite3.Row],
+    ) -> None:
+        for position, scenario_id in enumerate(scenario_set.scenario_ids, start=1):
+            scenario = members[scenario_id]
+            self.connection.execute(
+                "INSERT INTO scenario_set_members(set_id,scenario_id,position,scenario_sha256,scenario_revision) "
+                "VALUES(?,?,?,?,?)",
+                (set_id, scenario_id, position, scenario["content_sha256"], scenario["revision"]),
+            )
+
+    def create_scenario_set(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "scenario_set.write")
+        scenario_set = ScenarioSet.from_dict(raw)
+        members = self._validate_set_members(scenario_set)
+        definition = canonical_json(raw)
+        content_sha256 = hashlib.sha256(definition.encode("utf-8")).hexdigest()
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO scenario_sets(set_id,name,definition_json,content_sha256,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (scenario_set.set_id, scenario_set.name, definition, content_sha256, actor_id, self._now()),
+                )
+                self._insert_set_members(scenario_set.set_id, scenario_set, members)
+                self._audit("scenario_set", scenario_set.set_id, "scenario_set.created", actor_id, {"sha256": content_sha256})
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("情景集合编号或内容已经存在") from exc
+        return {"set_id": scenario_set.set_id, "state": "draft", "revision": 1, "sha256": content_sha256}
+
+    def update_scenario_set(self, actor_id: str, set_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "scenario_set.write")
+        row = self._scenario_set_row(set_id)
+        if row["state"] != "draft":
+            raise InvalidState("只有草稿集合可以编辑")
+        expected_revision = positive_integer(raw.get("expected_revision"), "expected_revision")
+        if str(raw.get("set_id", set_id)) != set_id:
+            raise ValidationFailed("set_id 与路径不一致")
+        scenario_set = ScenarioSet.from_dict(raw)
+        members = self._validate_set_members(scenario_set)
+        definition = canonical_json(raw)
+        content_sha256 = hashlib.sha256(definition.encode("utf-8")).hexdigest()
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "UPDATE scenario_sets SET name=?,definition_json=?,content_sha256=?,revision=revision+1 "
+                    "WHERE set_id=? AND state='draft' AND revision=?",
+                    (scenario_set.name, definition, content_sha256, set_id, expected_revision),
+                )
+                if cursor.rowcount != 1:
+                    raise InvalidState("情景集合不是当前草稿版本")
+                self.connection.execute("DELETE FROM scenario_set_members WHERE set_id=?", (set_id,))
+                self._insert_set_members(set_id, scenario_set, members)
+                self._audit(
+                    "scenario_set", set_id, "scenario_set.updated", actor_id,
+                    {"revision": expected_revision + 1, "sha256": content_sha256},
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("情景集合内容与已有集合重复") from exc
+        return {"set_id": set_id, "state": "draft", "revision": expected_revision + 1, "sha256": content_sha256}
+
+    def approve_scenario_set(self, actor_id: str, set_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "scenario_set.approve")
+        self._scenario_set_row(set_id)
+        with transaction(self.connection, immediate=True):
+            drafts = self.connection.execute(
+                "SELECT s.scenario_id FROM scenario_set_members m "
+                "JOIN supply_scenarios s ON s.scenario_id=m.scenario_id "
+                "WHERE m.set_id=? AND s.state<>'approved'",
+                (set_id,),
+            ).fetchall()
+            if drafts:
+                raise InvalidState("集合包含未批准情景: " + ", ".join(row["scenario_id"] for row in drafts))
+            cursor = self.connection.execute(
+                "UPDATE scenario_sets SET state='frozen',revision=revision+1,approved_by=?,approved_at=? "
+                "WHERE set_id=? AND state='draft' AND revision=?",
+                (actor_id, self._now(), set_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("情景集合不是当前草稿版本")
+            self.connection.execute(
+                "UPDATE scenario_set_members SET scenario_sha256=(SELECT content_sha256 FROM supply_scenarios "
+                "WHERE supply_scenarios.scenario_id=scenario_set_members.scenario_id), "
+                "scenario_revision=(SELECT revision FROM supply_scenarios "
+                "WHERE supply_scenarios.scenario_id=scenario_set_members.scenario_id) WHERE set_id=?",
+                (set_id,),
+            )
+            self._audit("scenario_set", set_id, "scenario_set.frozen", actor_id, {"revision": expected_revision + 1})
+        return {"set_id": set_id, "state": "frozen", "revision": expected_revision + 1}
+
+    def scenario_set(self, actor_id: str, set_id: str) -> dict[str, Any]:
+        self._require(actor_id, "scenario_set.read")
+        row = self._scenario_set_row(set_id)
+        members = self.connection.execute(
+            "SELECT m.scenario_id,m.position,m.scenario_sha256,m.scenario_revision,s.state AS scenario_state "
+            "FROM scenario_set_members m JOIN supply_scenarios s ON s.scenario_id=m.scenario_id "
+            "WHERE m.set_id=? ORDER BY m.position",
+            (set_id,),
+        ).fetchall()
+        return {
+            "set_id": set_id,
+            "name": row["name"],
+            "state": row["state"],
+            "revision": row["revision"],
+            "sha256": row["content_sha256"],
+            "definition": json.loads(row["definition_json"]),
+            "approved_by": row["approved_by"],
+            "approved_at": row["approved_at"],
+            "members": [dict(item) for item in members],
+            "created_at": row["created_at"],
+        }
+
+    def run_scenario_set(
+        self,
+        actor_id: str,
+        set_id: str,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "scenario_set.run")
+        row = self._scenario_set_row(set_id)
+        if row["state"] != "frozen":
+            raise InvalidState("只有审批后冻结的情景集合可以执行")
+        definition = json.loads(row["definition_json"])
+        date_from = date_text(date_from or definition["date_from"], "date_from")
+        date_to = date_text(date_to or definition["date_to"], "date_to")
+        if date_from < definition["date_from"] or date_to > definition["date_to"] or date_to < date_from:
+            raise ValidationFailed("执行日期区间必须是冻结区间的子集")
+        existing = self.connection.execute(
+            "SELECT set_run_id,summary_json FROM scenario_set_runs WHERE set_id=? AND content_sha256=? "
+            "AND date_from=? AND date_to=? AND algorithm_version=?",
+            (set_id, row["content_sha256"], date_from, date_to, ALGORITHM_VERSION),
+        ).fetchone()
+        if existing is not None:
+            return {"set_run_id": existing["set_run_id"], **json.loads(existing["summary_json"]), "replayed": True}
+
+        members = self.connection.execute(
+            "SELECT m.scenario_id,m.position,m.scenario_sha256,m.scenario_revision "
+            "FROM scenario_set_members m WHERE m.set_id=? ORDER BY m.position",
+            (set_id,),
+        ).fetchall()
+        start = date.fromisoformat(date_from)
+        dates = [
+            (start + timedelta(days=offset)).isoformat()
+            for offset in range((date.fromisoformat(date_to) - start).days + 1)
+        ]
+        plan = [(member, day) for day in dates for member in members]
+        if len(plan) > 5000:
+            raise ValidationFailed("批量回放单次最多执行 5000 个情景日")
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO scenario_set_runs(set_id,content_sha256,date_from,date_to,algorithm_version,"
+                "state,total_items,summary_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    set_id, row["content_sha256"], date_from, date_to, ALGORITHM_VERSION,
+                    "running", len(plan), canonical_json({}), actor_id, self._now(),
+                ),
+            )
+            set_run_id = int(cursor.lastrowid)
+
+        items: list[dict[str, Any]] = []
+        succeeded = 0
+        failed = 0
+        for position, (member, as_of_date) in enumerate(plan, start=1):
+            scenario_row = self.connection.execute(
+                "SELECT * FROM supply_scenarios WHERE scenario_id=?", (member["scenario_id"],)
+            ).fetchone()
+            if scenario_row is None:
+                raise NotFound("情景不存在")
+            item: dict[str, Any] = {
+                "position": position,
+                "scenario_id": member["scenario_id"],
+                "as_of_date": as_of_date,
+                "scenario_sha256": member["scenario_sha256"],
+                "scenario_revision": member["scenario_revision"],
+            }
+            try:
+                outcome = self._execute_scenario(scenario_row, as_of_date)
+                run_id, _, _ = self._store_scenario_run(scenario_row, as_of_date, outcome, actor_id, audit_event=False)
+                item.update({
+                    "state": "succeeded",
+                    "scenario_run_id": run_id,
+                    "result": outcome["result"],
+                    "input_sha256": outcome["input_sha256"],
+                    "algorithm_version": ALGORITHM_VERSION,
+                    "price_snapshot": outcome["price_snapshot"],
+                    "demand_changes": outcome["demand_changes"],
+                    "route_limits": outcome["route_limits"],
+                    "inventory_snapshot": outcome["inventory_snapshot"],
+                })
+                succeeded += 1
+            except SupplyError as exc:
+                item.update({"state": "failed", "failure_code": exc.code, "failure_reason": str(exc)})
+                failed += 1
+            self._store_set_run_item(set_run_id, item)
+            items.append(item)
+
+        summary = self._build_set_summary(row, date_from, date_to, items, succeeded, failed)
+        final_state = "completed" if failed == 0 else "completed_with_failures"
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE scenario_set_runs SET state=?,succeeded_items=?,failed_items=?,summary_json=? "
+                "WHERE set_run_id=?",
+                (final_state, succeeded, failed, canonical_json(summary), set_run_id),
+            )
+            self._audit(
+                "scenario_set", set_id, "scenario_set.executed", actor_id,
+                {"set_run_id": set_run_id, "succeeded": succeeded, "failed": failed},
+            )
+        return {"set_run_id": set_run_id, **summary, "replayed": False}
+
+    def _store_set_run_item(self, set_run_id: int, item: Mapping[str, Any]) -> None:
+        succeeded = item["state"] == "succeeded"
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO scenario_set_run_items(set_run_id,position,scenario_id,as_of_date,state,"
+                "scenario_run_id,result_json,input_sha256,algorithm_version,scenario_sha256,scenario_revision,"
+                "price_snapshot_json,demand_changes_json,route_limits_json,inventory_snapshot_json,"
+                "failure_code,failure_reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    set_run_id,
+                    item["position"],
+                    item["scenario_id"],
+                    item["as_of_date"],
+                    item["state"],
+                    item.get("scenario_run_id"),
+                    canonical_json(item["result"]) if succeeded else None,
+                    item.get("input_sha256"),
+                    item.get("algorithm_version"),
+                    item["scenario_sha256"],
+                    item["scenario_revision"],
+                    canonical_json(item["price_snapshot"]) if succeeded else None,
+                    canonical_json(item["demand_changes"]) if succeeded else None,
+                    canonical_json(item["route_limits"]) if succeeded else None,
+                    canonical_json(item["inventory_snapshot"]) if succeeded else None,
+                    None if succeeded else item["failure_code"],
+                    None if succeeded else item["failure_reason"],
+                    self._now(),
+                ),
+            )
+
+    def _build_set_summary(
+        self,
+        set_row: sqlite3.Row,
+        date_from: str,
+        date_to: str,
+        items: list[Mapping[str, Any]],
+        succeeded: int,
+        failed: int,
+    ) -> dict[str, Any]:
+        sum_capacity = ZERO
+        sum_inventory = ZERO
+        price_total = ZERO
+        fingerprints = []
+        for item in items:
+            if item["state"] == "succeeded":
+                result = item["result"]
+                sum_capacity += Decimal(result["total_projected_capacity"])
+                sum_inventory += Decimal(result["demand_adjusted_inventory"])
+                price_total += Decimal(result["projected_market_index_cny"])
+                fingerprint = {
+                    "scenario_id": item["scenario_id"],
+                    "as_of_date": item["as_of_date"],
+                    "state": "succeeded",
+                    "scenario_sha256": item["scenario_sha256"],
+                    "input_sha256": item["input_sha256"],
+                    "algorithm_version": item["algorithm_version"],
+                    "result_sha256": digest(result),
+                }
+            else:
+                fingerprint = {
+                    "scenario_id": item["scenario_id"],
+                    "as_of_date": item["as_of_date"],
+                    "state": "failed",
+                    "scenario_sha256": item["scenario_sha256"],
+                    "failure_code": item["failure_code"],
+                    "failure_reason": item["failure_reason"],
+                }
+            fingerprints.append(fingerprint)
+        aggregate = {
+            "sum_projected_capacity_mwh": decimal_text(quantize_volume(sum_capacity)),
+            "sum_demand_adjusted_inventory_mwh": decimal_text(quantize_volume(sum_inventory)),
+            "average_projected_index_cny": (
+                decimal_text(quantize_money(price_total / Decimal(succeeded))) if succeeded else None
+            ),
+        }
+        return {
+            "set_id": set_row["set_id"],
+            "content_sha256": set_row["content_sha256"],
+            "date_from": date_from,
+            "date_to": date_to,
+            "algorithm_version": ALGORITHM_VERSION,
+            "total_items": len(items),
+            "succeeded_items": succeeded,
+            "failed_items": failed,
+            "aggregate": aggregate,
+            "items_digest": digest(fingerprints),
+        }
+
+    def _verify_chain(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT * FROM supply_audit_events ORDER BY event_id").fetchall()
         previous_hash = "0" * 64
         valid = True
@@ -569,3 +1017,82 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    def scenario_set_run_report(self, actor_id: str, set_run_id: int) -> dict[str, Any]:
+        self._require(actor_id, "scenario_set.read")
+        run = self.connection.execute("SELECT * FROM scenario_set_runs WHERE set_run_id=?", (set_run_id,)).fetchone()
+        if run is None:
+            raise NotFound("批量回放不存在")
+        item_rows = self.connection.execute(
+            "SELECT * FROM scenario_set_run_items WHERE set_run_id=? ORDER BY position", (set_run_id,)
+        ).fetchall()
+        items = []
+        for row in item_rows:
+            item = {
+                "position": row["position"],
+                "scenario_id": row["scenario_id"],
+                "as_of_date": row["as_of_date"],
+                "state": row["state"],
+                "scenario_sha256": row["scenario_sha256"],
+                "scenario_revision": row["scenario_revision"],
+            }
+            if row["state"] == "succeeded":
+                item.update({
+                    "scenario_run_id": row["scenario_run_id"],
+                    "result": json.loads(row["result_json"]),
+                    "input_sha256": row["input_sha256"],
+                    "algorithm_version": row["algorithm_version"],
+                    "snapshots": {
+                        "price_version": json.loads(row["price_snapshot_json"]),
+                        "demand_changes": json.loads(row["demand_changes_json"]),
+                        "route_limits": json.loads(row["route_limits_json"]),
+                        "inventory": json.loads(row["inventory_snapshot_json"]),
+                    },
+                })
+            else:
+                item.update({"failure": {"code": row["failure_code"], "reason": row["failure_reason"]}})
+            items.append(item)
+        set_id = run["set_id"]
+        member_ids = [
+            row["scenario_id"]
+            for row in self.connection.execute(
+                "SELECT scenario_id FROM scenario_set_members WHERE set_id=? ORDER BY position", (set_id,)
+            ).fetchall()
+        ]
+        entity_ids = [set_id, *member_ids]
+        placeholders = ",".join("?" for _ in entity_ids)
+        event_rows = self.connection.execute(
+            "SELECT event_id,entity_type,entity_id,event_type,actor_id,payload_json,previous_hash,event_hash,created_at "
+            f"FROM supply_audit_events WHERE (entity_type='scenario_set' AND entity_id=?) "
+            f"OR (entity_type='scenario' AND entity_id IN ({placeholders})) ORDER BY event_id",
+            [set_id, *entity_ids],
+        ).fetchall()
+        audit_trail = [
+            {
+                "event_id": row["event_id"],
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "event_type": row["event_type"],
+                "actor_id": row["actor_id"],
+                "payload": json.loads(row["payload_json"]),
+                "previous_hash": row["previous_hash"],
+                "event_hash": row["event_hash"],
+                "created_at": row["created_at"],
+            }
+            for row in event_rows
+        ]
+        return {
+            "set_run_id": set_run_id,
+            "set_id": set_id,
+            "state": run["state"],
+            "summary": json.loads(run["summary_json"]),
+            "items": items,
+            "audit_trail": audit_trail,
+            "chain": self._verify_chain(),
+            "created_by": run["created_by"],
+            "created_at": run["created_at"],
+        }
+
+    def audit_chain(self, actor_id: str) -> dict[str, Any]:
+        self._require(actor_id, "audit.read")
+        return self._verify_chain()

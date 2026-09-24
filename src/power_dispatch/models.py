@@ -260,3 +260,41 @@ class SupplyScenario:
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioSet:
+    set_id: str
+    name: str
+    scenario_ids: tuple[str, ...]
+    date_from: str
+    date_to: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ScenarioSet":
+        ids = raw.get("scenario_ids")
+        if not isinstance(ids, list) or not ids:
+            raise ValidationFailed("scenario_ids 必须是非空数组")
+        if len(ids) > 500:
+            raise ValidationFailed("情景集合最多包含 500 个情景")
+        parsed = tuple(identifier(value, "scenario_ids") for value in ids)
+        if len(set(parsed)) != len(parsed):
+            raise ValidationFailed("情景集合不能重复包含同一情景")
+        date_from = date_text(raw.get("date_from"), "date_from")
+        date_to = date_text(raw.get("date_to"), "date_to")
+        if date_to < date_from:
+            raise ValidationFailed("date_to 不能早于 date_from")
+        try:
+            start = date.fromisoformat(date_from)
+            end = date.fromisoformat(date_to)
+        except ValueError as exc:  # pragma: no cover - date_text 已校验
+            raise ValidationFailed("日期区间不合法") from exc
+        if (end - start).days > 366:
+            raise ValidationFailed("日期区间不能超过 366 天")
+        return cls(
+            set_id=identifier(raw.get("set_id"), "set_id"),
+            name=required_text(raw.get("name"), "name"),
+            scenario_ids=parsed,
+            date_from=date_from,
+            date_to=date_to,
+        )

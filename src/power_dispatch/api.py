@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -83,6 +84,18 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/scenario-sets":
+                return Response(201, self.service.create_scenario_set(actor, payload))
+            if method == "PUT" and len(parts) == 2 and parts[0] == "scenario-sets":
+                return Response(200, self.service.update_scenario_set(actor, parts[1], payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "scenario-sets":
+                return Response(200, self.service.scenario_set(actor, parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "scenario-sets" and parts[2] == "approve":
+                return Response(200, self.service.approve_scenario_set(actor, parts[1], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "scenario-sets" and parts[2] == "runs":
+                return Response(200, self.service.run_scenario_set(actor, parts[1], payload.get("date_from"), payload.get("date_to")))
+            if method == "GET" and len(parts) == 2 and parts[0] == "scenario-set-runs":
+                return Response(200, self.service.scenario_set_run_report(actor, int(parts[1])))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
@@ -93,6 +106,9 @@ class JsonApplication:
 
 
 def make_handler(application: JsonApplication):
+    # SQLite 连接与审计哈希链都要求请求串行执行。
+    dispatch_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "PowerDispatch/1"
 
@@ -102,10 +118,14 @@ def make_handler(application: JsonApplication):
         def do_POST(self) -> None:  # noqa: N802
             self._dispatch()
 
+        def do_PUT(self) -> None:  # noqa: N802
+            self._dispatch()
+
         def _dispatch(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
-            response = application.handle(self.command, self.path, dict(self.headers.items()), body)
+            with dispatch_lock:
+                response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             encoded = json.dumps(response.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
