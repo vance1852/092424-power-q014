@@ -171,6 +171,57 @@ CREATE TABLE IF NOT EXISTS scenario_runs (
     UNIQUE(scenario_id, as_of_date, input_sha256)
 );
 
+CREATE TABLE IF NOT EXISTS scenario_sets (
+    set_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    start_date TEXT,
+    end_date TEXT,
+    scenario_ids_json TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','approved','retired')),
+    revision INTEGER NOT NULL DEFAULT 1,
+    frozen_snapshot_json TEXT,
+    snapshot_sha256 TEXT,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scenario_set_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    set_id TEXT NOT NULL REFERENCES scenario_sets(set_id),
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    set_snapshot_sha256 TEXT NOT NULL,
+    algorithm_version TEXT NOT NULL,
+    summary_json TEXT NOT NULL,
+    summary_sha256 TEXT NOT NULL,
+    results_count INTEGER NOT NULL,
+    failure_count INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'posted' CHECK(state IN ('posted')),
+    replayed_of_run_id INTEGER REFERENCES scenario_set_runs(run_id),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(set_id, start_date, end_date, summary_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS scenario_set_run_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES scenario_set_runs(run_id),
+    set_id TEXT NOT NULL REFERENCES scenario_sets(set_id),
+    scenario_id TEXT NOT NULL,
+    service_date TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('succeeded','failed')),
+    input_snapshot_json TEXT,
+    input_sha256 TEXT,
+    result_json TEXT,
+    failure_code TEXT,
+    failure_message TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, scenario_id, service_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scenario_set_items_lookup
+ON scenario_set_run_items(set_id, scenario_id, service_date, item_id);
+
 CREATE TABLE IF NOT EXISTS supply_idempotency (
     scope TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,

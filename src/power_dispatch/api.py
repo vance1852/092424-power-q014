@@ -83,6 +83,21 @@ class JsonApplication:
                 return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+            if method == "POST" and path == "/scenario-sets":
+                return Response(201, self.service.create_scenario_set(actor, payload))
+            if method == "PUT" and len(parts) == 2 and parts[0] == "scenario-sets":
+                return Response(200, self.service.update_scenario_set(actor, parts[1], payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "scenario-sets" and parts[2] == "approve":
+                return Response(200, self.service.approve_scenario_set(actor, parts[1], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "scenario-sets" and parts[2] == "run":
+                return Response(200, self.service.run_scenario_set(actor, parts[1], payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "scenario-sets":
+                return Response(200, self.service.scenario_set(actor, parts[1]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "scenario-set-runs":
+                return Response(200, self.service.scenario_set_run(actor, int(parts[1])))
+            if method == "GET" and len(parts) == 3 and parts[0] == "scenario-sets" and parts[2] == "results":
+                scenario_id = query.get("scenario_id", [""])[0] or None
+                return Response(200, self.service.scenario_set_results(actor, parts[1], scenario_id))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
@@ -100,6 +115,9 @@ def make_handler(application: JsonApplication):
             self._dispatch()
 
         def do_POST(self) -> None:  # noqa: N802
+            self._dispatch()
+
+        def do_PUT(self) -> None:  # noqa: N802
             self._dispatch()
 
         def _dispatch(self) -> None:

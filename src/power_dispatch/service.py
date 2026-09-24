@@ -10,8 +10,18 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .clock import SystemClock, parse_utc, utc_text
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .errors import Conflict, Forbidden, InvalidState, NotFound, SupplyError, ValidationFailed
+from .models import (
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    date_text,
+    identifier,
+    required_text,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -27,13 +37,28 @@ from .planning import (
     scenario_projection,
     weighted_inventory_cost,
 )
+from .replay import (
+    ALGORITHM_VERSION,
+    build_snapshot,
+    enumerate_dates,
+    items_digest,
+    project_snapshot,
+    summarize_items,
+)
 from .storage import initialize, transaction
 
 
 ROLE_PERMISSIONS = {
-    "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
+    "planner": {
+        "quote.write",
+        "catalog.write",
+        "scenario.write",
+        "scenario.run",
+        "scenarioset.write",
+        "scenarioset.run",
+    },
     "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
-    "risk": {"outage.write", "scenario.approve", "report.read"},
+    "risk": {"outage.write", "scenario.approve", "scenarioset.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
 
@@ -548,8 +573,483 @@ class SupplyService:
             self._audit("scenario", scenario_id, "scenario.executed", actor_id, {"run_id": run_id})
         return {"run_id": run_id, **result, "replayed": False}
 
-    def audit_chain(self, actor_id: str) -> dict[str, Any]:
-        self._require(actor_id, "audit.read")
+    # ------------------------------------------------------------------
+    # 情景集合与批量回放
+    # ------------------------------------------------------------------
+
+    def _scenario_set_row(self, set_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM scenario_sets WHERE set_id=?", (set_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("情景集合不存在")
+        return row
+
+    @staticmethod
+    def _set_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+        scenario_ids = raw.get("scenario_ids")
+        if not isinstance(scenario_ids, list) or not scenario_ids:
+            raise ValidationFailed("scenario_ids 必须是非空数组")
+        cleaned: list[str] = []
+        for value in scenario_ids:
+            scenario_id = identifier(value, "scenario_ids 元素")
+            if scenario_id in cleaned:
+                raise ValidationFailed("情景集合成员不能重复")
+            cleaned.append(scenario_id)
+        start_date = raw.get("start_date")
+        end_date = raw.get("end_date")
+        if start_date is None or end_date is None:
+            raise ValidationFailed("必须提供 start_date 和 end_date")
+        start = date_text(start_date, "start_date")
+        end = date_text(end_date, "end_date")
+        try:
+            enumerate_dates(start, end)
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return {
+            "set_id": identifier(raw.get("set_id"), "set_id"),
+            "name": required_text(raw.get("name"), "name"),
+            "start_date": start,
+            "end_date": end,
+            "scenario_ids": cleaned,
+        }
+
+    def _load_member_scenarios(self, scenario_ids: list[str]) -> list[sqlite3.Row]:
+        rows = []
+        for scenario_id in scenario_ids:
+            row = self.connection.execute(
+                "SELECT * FROM supply_scenarios WHERE scenario_id=?", (scenario_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"情景 {scenario_id} 不存在")
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _scenario_set_view(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "set_id": row["set_id"],
+            "name": row["name"],
+            "start_date": row["start_date"],
+            "end_date": row["end_date"],
+            "scenario_ids": json.loads(row["scenario_ids_json"]),
+            "state": row["state"],
+            "revision": row["revision"],
+            "snapshot_sha256": row["snapshot_sha256"],
+        }
+
+    def create_scenario_set(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "scenarioset.write")
+        payload = self._set_payload(raw)
+        self._load_member_scenarios(payload["scenario_ids"])
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO scenario_sets(set_id,name,start_date,end_date,scenario_ids_json,"
+                "created_by,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    payload["set_id"],
+                    payload["name"],
+                    payload["start_date"],
+                    payload["end_date"],
+                    canonical_json(payload["scenario_ids"]),
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            self._audit(
+                "scenario_set",
+                payload["set_id"],
+                "scenarioset.created",
+                actor_id,
+                {"scenario_ids": payload["scenario_ids"]},
+            )
+        return self._scenario_set_view(self._scenario_set_row(payload["set_id"]))
+
+    def update_scenario_set(self, actor_id: str, set_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "scenarioset.write")
+        existing = self._scenario_set_row(set_id)
+        if existing["state"] != "draft":
+            raise InvalidState("只有草稿集合可以编辑")
+        expected_revision = int(raw.get("expected_revision", existing["revision"]))
+        merged = {
+            "set_id": set_id,
+            "name": raw.get("name", existing["name"]),
+            "start_date": raw.get("start_date", existing["start_date"]),
+            "end_date": raw.get("end_date", existing["end_date"]),
+            "scenario_ids": raw.get("scenario_ids", json.loads(existing["scenario_ids_json"])),
+        }
+        payload = self._set_payload(merged)
+        self._load_member_scenarios(payload["scenario_ids"])
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE scenario_sets SET name=?,start_date=?,end_date=?,scenario_ids_json=?,"
+                "revision=revision+1 WHERE set_id=? AND state='draft' AND revision=?",
+                (
+                    payload["name"],
+                    payload["start_date"],
+                    payload["end_date"],
+                    canonical_json(payload["scenario_ids"]),
+                    set_id,
+                    expected_revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("情景集合不是当前草稿版本")
+            self._audit(
+                "scenario_set",
+                set_id,
+                "scenarioset.updated",
+                actor_id,
+                {"scenario_ids": payload["scenario_ids"], "revision": expected_revision + 1},
+            )
+        return self._scenario_set_view(self._scenario_set_row(set_id))
+
+    def approve_scenario_set(self, actor_id: str, set_id: str, expected_revision: int) -> dict[str, Any]:
+        self._require(actor_id, "scenarioset.approve")
+        existing = self._scenario_set_row(set_id)
+        if existing["state"] != "draft":
+            raise InvalidState("情景集合不是草稿状态")
+        scenario_ids = json.loads(existing["scenario_ids_json"])
+        members = self._load_member_scenarios(scenario_ids)
+        if any(row["state"] != "approved" for row in members):
+            raise InvalidState("集合内存在未批准情景，不能冻结")
+        snapshot = {
+            "set_id": set_id,
+            "name": existing["name"],
+            "start_date": existing["start_date"],
+            "end_date": existing["end_date"],
+            "algorithm_version": ALGORITHM_VERSION,
+            "members": [
+                {
+                    "scenario_id": row["scenario_id"],
+                    "name": row["name"],
+                    "state": row["state"],
+                    "revision": row["revision"],
+                    "content_sha256": row["content_sha256"],
+                    "definition": json.loads(row["definition_json"]),
+                }
+                for row in members
+            ],
+        }
+        snapshot_json = canonical_json(snapshot)
+        snapshot_sha256 = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE scenario_sets SET state='approved',revision=revision+1,"
+                "frozen_snapshot_json=?,snapshot_sha256=? "
+                "WHERE set_id=? AND state='draft' AND revision=?",
+                (snapshot_json, snapshot_sha256, set_id, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("情景集合不是当前草稿版本")
+            self._audit(
+                "scenario_set",
+                set_id,
+                "scenarioset.approved",
+                actor_id,
+                {"snapshot_sha256": snapshot_sha256, "members": len(members)},
+            )
+        return self._scenario_set_view(self._scenario_set_row(set_id))
+
+    def scenario_set(self, actor_id: str, set_id: str) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        row = self._scenario_set_row(set_id)
+        return {
+            "set_id": row["set_id"],
+            "name": row["name"],
+            "start_date": row["start_date"],
+            "end_date": row["end_date"],
+            "scenario_ids": json.loads(row["scenario_ids_json"]),
+            "state": row["state"],
+            "revision": row["revision"],
+            "snapshot_sha256": row["snapshot_sha256"],
+        }
+
+    def run_scenario_set(self, actor_id: str, set_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "scenarioset.run")
+        row = self._scenario_set_row(set_id)
+        if row["state"] != "approved":
+            raise InvalidState("只有已批准（已冻结）情景集合可以回放")
+        if row["frozen_snapshot_json"] is None:
+            raise InvalidState("集合缺少冻结快照")
+        snapshot = json.loads(row["frozen_snapshot_json"])
+        start_date = raw.get("start_date", row["start_date"])
+        end_date = raw.get("end_date", row["end_date"])
+        start = date_text(start_date, "start_date")
+        end = date_text(end_date, "end_date")
+        try:
+            dates = enumerate_dates(start, end)
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        if start < snapshot["start_date"] or end > snapshot["end_date"]:
+            raise ValidationFailed("执行区间必须落在集合区间内")
+
+        # 在单个只读事务内采集所有输入快照，确保跨表读到同一数据库快照。
+        captured: list[dict[str, Any]] = []
+        with transaction(self.connection):
+            for member in snapshot["members"]:
+                scenario_id = member["scenario_id"]
+                scenario_row = self.connection.execute(
+                    "SELECT * FROM supply_scenarios WHERE scenario_id=?", (scenario_id,)
+                ).fetchone()
+                for service_date in dates:
+                    captured.append(self._replay_cell(scenario_row, member, service_date))
+
+        summary = summarize_items(captured)
+        items_hash = items_digest(captured)
+        summary_sha256 = digest(
+            {
+                "set_id": set_id,
+                "set_snapshot_sha256": row["snapshot_sha256"],
+                "start_date": start,
+                "end_date": end,
+                "algorithm_version": ALGORITHM_VERSION,
+                "items_sha256": items_hash,
+                "summary": summary,
+            }
+        )
+        existing = self.connection.execute(
+            "SELECT run_id,replayed_of_run_id FROM scenario_set_runs "
+            "WHERE set_id=? AND start_date=? AND end_date=? AND summary_sha256=?",
+            (set_id, start, end, summary_sha256),
+        ).fetchone()
+        if existing is not None:
+            return self._set_run_view(existing["run_id"], replayed=True)
+
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "INSERT INTO scenario_set_runs(set_id,start_date,end_date,set_snapshot_sha256,"
+                    "algorithm_version,summary_json,summary_sha256,results_count,failure_count,"
+                    "created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        set_id,
+                        start,
+                        end,
+                        row["snapshot_sha256"],
+                        ALGORITHM_VERSION,
+                        canonical_json(summary),
+                        summary_sha256,
+                        summary["results_count"],
+                        summary["failure_count"],
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
+                for cell in captured:
+                    self.connection.execute(
+                        "INSERT INTO scenario_set_run_items(run_id,set_id,scenario_id,service_date,"
+                        "status,input_snapshot_json,input_sha256,result_json,failure_code,"
+                        "failure_message,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            run_id,
+                            set_id,
+                            cell["scenario_id"],
+                            cell["service_date"],
+                            cell["status"],
+                            cell.get("input_snapshot_json"),
+                            cell.get("input_sha256"),
+                            cell.get("result_json"),
+                            cell.get("failure_code"),
+                            cell.get("failure_message"),
+                            self._now(),
+                        ),
+                    )
+                self._audit(
+                    "scenario_set",
+                    set_id,
+                    "scenarioset.replayed",
+                    actor_id,
+                    {
+                        "run_id": run_id,
+                        "summary_sha256": summary_sha256,
+                        "results": summary["results_count"],
+                        "failures": summary["failure_count"],
+                    },
+                )
+        except sqlite3.IntegrityError:
+            # 并发产生了相同摘要的回放，复用既有结果。
+            existing = self.connection.execute(
+                "SELECT run_id FROM scenario_set_runs "
+                "WHERE set_id=? AND start_date=? AND end_date=? AND summary_sha256=?",
+                (set_id, start, end, summary_sha256),
+            ).fetchone()
+            if existing is not None:
+                return self._set_run_view(int(existing["run_id"]), replayed=True)
+            raise
+        return self._set_run_view(run_id, replayed=False)
+
+    def _replay_cell(
+        self,
+        scenario_row: sqlite3.Row,
+        member: Mapping[str, Any],
+        service_date: str,
+    ) -> dict[str, Any]:
+        scenario_id = member["scenario_id"]
+        base: dict[str, Any] = {"scenario_id": scenario_id, "service_date": service_date}
+        input_snapshot: dict[str, Any] | None = None
+
+        def failure(code: str, message: str) -> dict[str, Any]:
+            return {
+                **base,
+                "status": "failed",
+                "input_snapshot_json": None
+                if input_snapshot is None
+                else canonical_json(input_snapshot),
+                "input_sha256": None if input_snapshot is None else input_snapshot["snapshot_sha256"],
+                "result_json": None,
+                "failure_code": code,
+                "failure_message": message,
+            }
+
+        try:
+            if scenario_row is None or scenario_row["content_sha256"] != member["content_sha256"]:
+                # 冻结成员必须使用批准时的定义，即使情景之后被修改或删除。
+                frozen_row = {
+                    "scenario_id": scenario_id,
+                    "content_sha256": member["content_sha256"],
+                    "definition_json": canonical_json(member["definition"]),
+                }
+                input_snapshot = build_snapshot(
+                    connection=self.connection, scenario_row=frozen_row, service_date=service_date
+                )
+            else:
+                input_snapshot = build_snapshot(
+                    connection=self.connection, scenario_row=scenario_row, service_date=service_date
+                )
+            if input_snapshot["price_version"] is None:
+                return failure("invalid_state", "截止日期没有可用电价版本")
+            result = project_snapshot(input_snapshot)
+            return {
+                **base,
+                "status": "succeeded",
+                "input_snapshot_json": canonical_json(input_snapshot),
+                "input_sha256": input_snapshot["snapshot_sha256"],
+                "result_json": canonical_json(result),
+                "failure_code": None,
+                "failure_message": None,
+            }
+        except SupplyError as exc:
+            return failure(exc.code, str(exc))
+        except (ValueError, ArithmeticError) as exc:
+            return failure("projection_failed", str(exc))
+
+    def _set_run_view(self, run_id: int, *, replayed: bool) -> dict[str, Any]:
+        run = self.connection.execute(
+            "SELECT * FROM scenario_set_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if run is None:
+            raise NotFound("回放结果不存在")
+        return {
+            "run_id": run_id,
+            "set_id": run["set_id"],
+            "start_date": run["start_date"],
+            "end_date": run["end_date"],
+            "state": run["state"],
+            "replayed": replayed,
+            "replayed_of_run_id": run["replayed_of_run_id"],
+            "set_snapshot_sha256": run["set_snapshot_sha256"],
+            "algorithm_version": run["algorithm_version"],
+            "summary": json.loads(run["summary_json"]),
+            "summary_sha256": run["summary_sha256"],
+            "created_by": run["created_by"],
+            "created_at": run["created_at"],
+        }
+
+    def scenario_set_run(self, actor_id: str, run_id: int) -> dict[str, Any]:
+        self._require(actor_id, "report.read")
+        view = self._set_run_view(run_id, replayed=False)
+        items = self.connection.execute(
+            "SELECT * FROM scenario_set_run_items WHERE run_id=? ORDER BY scenario_id,service_date",
+            (run_id,),
+        ).fetchall()
+        view["items"] = [self._item_view(row) for row in items]
+        return view
+
+    def scenario_set_results(
+        self, actor_id: str, set_id: str, scenario_id: str | None = None
+    ) -> dict[str, Any]:
+        """返回集合下全部（或指定情景）的回放结果与完整审计链。"""
+        self._require(actor_id, "report.read")
+        row = self._scenario_set_row(set_id)
+        run_rows = self.connection.execute(
+            "SELECT run_id FROM scenario_set_runs WHERE set_id=? ORDER BY run_id", (set_id,)
+        ).fetchall()
+        runs: list[dict[str, Any]] = []
+        for run_row in run_rows:
+            run = self._set_run_view(int(run_row["run_id"]), replayed=False)
+            query = (
+                "SELECT * FROM scenario_set_run_items WHERE run_id=? AND scenario_id=? "
+                "ORDER BY service_date"
+                if scenario_id is not None
+                else "SELECT * FROM scenario_set_run_items WHERE run_id=? ORDER BY scenario_id,service_date"
+            )
+            params = (run_row["run_id"], scenario_id) if scenario_id is not None else (run_row["run_id"],)
+            run["items"] = [
+                self._item_view(item)
+                for item in self.connection.execute(query, params).fetchall()
+            ]
+            runs.append(run)
+        events = self._audit_trail_for_set(row)
+        chain = self._audit_chain_status()
+        return {
+            "set_id": set_id,
+            "set_state": row["state"],
+            "set_snapshot_sha256": row["snapshot_sha256"],
+            "algorithm_version": ALGORITHM_VERSION,
+            "runs": runs,
+            "audit_trail": events,
+            "audit_chain": chain,
+        }
+
+    @staticmethod
+    def _item_view(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "item_id": row["item_id"],
+            "scenario_id": row["scenario_id"],
+            "service_date": row["service_date"],
+            "status": row["status"],
+            "input_sha256": row["input_sha256"],
+            "input_snapshot": None
+            if row["input_snapshot_json"] is None
+            else json.loads(row["input_snapshot_json"]),
+            "result": None if row["result_json"] is None else json.loads(row["result_json"]),
+            "failure": None
+            if row["failure_code"] is None
+            else {"code": row["failure_code"], "message": row["failure_message"]},
+        }
+
+    def _audit_trail_for_set(self, set_row: sqlite3.Row) -> list[dict[str, Any]]:
+        member_ids = set(json.loads(set_row["scenario_ids_json"]))
+        if set_row["frozen_snapshot_json"] is not None:
+            frozen = json.loads(set_row["frozen_snapshot_json"])
+            member_ids.update(member["scenario_id"] for member in frozen["members"])
+        rows = self.connection.execute(
+            "SELECT * FROM supply_audit_events ORDER BY event_id"
+        ).fetchall()
+        trail: list[dict[str, Any]] = []
+        for row in rows:
+            related = (
+                (row["entity_type"] == "scenario_set" and row["entity_id"] == set_row["set_id"])
+                or (row["entity_type"] == "scenario" and row["entity_id"] in member_ids)
+            )
+            if not related:
+                continue
+            trail.append({
+                "event_id": row["event_id"],
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "event_type": row["event_type"],
+                "actor_id": row["actor_id"],
+                "payload": json.loads(row["payload_json"]),
+                "created_at": row["created_at"],
+                "previous_hash": row["previous_hash"],
+                "event_hash": row["event_hash"],
+            })
+        return trail
+
+    def _audit_chain_status(self) -> dict[str, Any]:
         rows = self.connection.execute("SELECT * FROM supply_audit_events ORDER BY event_id").fetchall()
         previous_hash = "0" * 64
         valid = True
@@ -569,3 +1069,7 @@ class SupplyService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    def audit_chain(self, actor_id: str) -> dict[str, Any]:
+        self._require(actor_id, "audit.read")
+        return self._audit_chain_status()

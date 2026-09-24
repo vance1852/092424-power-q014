@@ -30,7 +30,14 @@ def run(workspace: Path) -> dict[str, object]:
     service.create_scenario("plan", {"scenario_id": "pipeline-restart", "name": "关键机组检修恢复与需求回落", "market_index_drop_percent": "9", "route_capacity_changes": {"pipe-a-b": "20"}, "demand_changes": {"field-a:crude": "-5"}})
     service.approve_scenario("risk", "pipeline-restart", 1)
     scenario = service.run_scenario("plan", "pipeline-restart", "2026-09-23")
-    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
+    service.create_scenario("plan", {"scenario_id": "demand-surge", "name": "需求回升与送出受限", "market_index_drop_percent": "2", "route_capacity_changes": {"pipe-a-b": "-30"}, "demand_changes": {"field-a:crude": "8"}})
+    service.approve_scenario("risk", "demand-surge", 1)
+    service.create_scenario_set("plan", {"set_id": "peak-valley-compare", "name": "峰谷电价三假设对比", "start_date": "2026-09-18", "end_date": "2026-09-23", "scenario_ids": ["pipeline-restart", "demand-surge"]})
+    service.approve_scenario_set("risk", "peak-valley-compare", 1)
+    set_run = service.run_scenario_set("plan", "peak-valley-compare", {})
+    set_replay = service.run_scenario_set("plan", "peak-valley-compare", {})
+    set_results = service.scenario_set_results("audit", "peak-valley-compare")
+    result = {"status": "ok", "price": service.price_summary("PEAK_VALLEY"), "allocation_id": allocation["allocation_id"], "transfer": transfer, "scenario_run_id": scenario["run_id"], "scenario_set_run_id": set_run["run_id"], "scenario_set_replayed": set_replay["replayed"], "scenario_set_summary": set_run["summary"], "scenario_set_audit_valid": set_results["audit_chain"]["valid"], "audit": service.audit_chain("audit"), "workspace": workspace.name}
     connection.close()
     return result
 
